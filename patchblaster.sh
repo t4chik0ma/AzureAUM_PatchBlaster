@@ -131,6 +131,20 @@ patchinstallationresources
 '
 }
 
+# Function to get ALL VMs (for global assessment)
+get_all_vms() {
+    echo "Getting all Windows VMs across all subscriptions..."
+    SUBS=$(az account list --query "[?state=='Enabled'].id" -o tsv)
+    
+    az graph query --subscriptions $(echo $SUBS) --query "data[]" -o json -q '
+Resources
+| where type == "microsoft.compute/virtualmachines"
+| where tostring(properties.storageProfile.osDisk.osType) == "Windows"
+| where tostring(properties.extended.instanceView.powerState.displayStatus) == "VM running"
+| project id
+' 2>/dev/null | jq -r '.[].id' 2>/dev/null
+}
+
 # Function to get VMs with no recent assessment data
 get_no_assessment_machines() {
     echo "Getting machines with no recent assessment data..."
@@ -631,8 +645,7 @@ show_live_status() {
 # Function to show detailed target machine information
 show_target_details() {
     clear
-    echo -e "${WHITE}Target Machines Details${NC}"
-    echo -e "======================="
+    echo -e "${WHITE}=== Target Machines Details ===${NC}"
     echo
     
     # Get the current target machines
@@ -672,6 +685,11 @@ show_target_details() {
         cp "$pending_vms" "$target_file" 2>/dev/null
     fi
     
+    local target_count=$(safe_count "$target_file")
+    
+    echo -e "${YELLOW}Found $target_count target machines (pending updates, not currently patching):${NC}"
+    echo
+    
     printf "%-30s %-25s %-12s\n" "VM Name" "Resource Group" "Subscription"
     printf "%-30s %-25s %-12s\n" "-------" "--------------" "------------"
     
@@ -681,38 +699,235 @@ show_target_details() {
         fi
     done < "$target_file"
     
+    echo
+    echo -e "${WHITE}Available Actions for these $target_count VMs:${NC}"
+    echo -e "${BLUE}1)${NC} Restart all target VMs"
+    echo -e "${BLUE}2)${NC} Trigger assessment on all target VMs"
+    echo -e "${BLUE}3)${NC} Install patches on all target VMs"
+    echo -e "${BLUE}4)${NC} Export list to file"
+    echo -e "${BLUE}5)${NC} Return to previous menu"
+    echo
+    
+    read -p "Select action (1-5): " action
+    
+    case $action in
+        1)
+            echo
+            read -p "Restart all $target_count target VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Restarting target VMs...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        restart_vm "$subscription" "$rg" "$vm_name" &
+                        (($(jobs -r | wc -l) >= 10)) && wait
+                    fi
+                done < "$target_file"
+                wait
+                echo -e "${GREEN}All restart commands issued.${NC}"
+            fi
+            ;;
+        2)
+            echo
+            read -p "Trigger assessment on all $target_count target VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Triggering assessments...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        trigger_assessment "$subscription" "$rg" "$vm_name" &
+                        (($(jobs -r | wc -l) >= 10)) && wait
+                    fi
+                done < "$target_file"
+                wait
+                echo -e "${GREEN}All assessment commands issued.${NC}"
+            fi
+            ;;
+        3)
+            echo
+            read -p "Install patches on all $target_count target VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Installing patches...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        install_updates "$subscription" "$rg" "$vm_name"
+                    fi
+                done < "$target_file"
+                echo -e "${GREEN}All patch installation commands issued.${NC}"
+            fi
+            ;;
+        4)
+            OUTPUT_FILE="target_vms_$(date +%Y%m%d_%H%M%S).txt"
+            {
+                echo "Target VMs - $(date)"
+                echo "===================="
+                printf "%-30s %-25s %-40s\n" "VM Name" "Resource Group" "Subscription ID"
+                printf "%-30s %-25s %-40s\n" "-------" "--------------" "---------------"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        printf "%-30s %-25s %-40s\n" "$vm_name" "$rg" "$subscription"
+                    fi
+                done < "$target_file"
+            } > "$OUTPUT_FILE"
+            echo -e "${GREEN}Exported to: $OUTPUT_FILE${NC}"
+            ;;
+        5)
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
+    
     rm -f "$pending_file" "$inprogress_file" "$target_file" "$pending_vms" "$inprogress_vms"
 }
 
 # Function to show failed machine details
 show_failed_details() {
     clear
-    echo -e "${RED}Failed Machines Details${NC}"
-    echo -e "======================="
+    echo -e "${RED}=== Failed Machines Details ===${NC}"
     echo
     
     local failed_file=$(mktemp)
+    local failed_vms=$(mktemp)
+    
     get_failed_machines > "$failed_file" 2>/dev/null
     sed -i '/Getting machines/d' "$failed_file" 2>/dev/null
     
-    if [ ! -s "$failed_file" ]; then
+    local failed_count=$(safe_count "$failed_file")
+    
+    if [ "$failed_count" -eq 0 ]; then
         echo "No failed machines found."
-        rm -f "$failed_file"
+        rm -f "$failed_file" "$failed_vms"
         return
     fi
     
-    printf "%-30s %-25s %-12s\n" "VM Name" "Resource Group" "Subscription"
-    printf "%-30s %-25s %-12s\n" "-------" "--------------" "------------"
-    
+    # Convert to VM identifiers
     while IFS= read -r resource_id; do
         if [ -n "$resource_id" ]; then
             vm_info=$(parse_vm_info "$resource_id")
             read -r subscription rg vm_name <<< "$vm_info"
-            printf "%-30s %-25s %-12s\n" "$vm_name" "$rg" "${subscription:0:8}..."
+            echo "${vm_name}|${rg}|${subscription}" >> "$failed_vms"
         fi
     done < "$failed_file"
     
-    rm -f "$failed_file"
+    echo -e "${RED}Found $failed_count machines with failed patch installations:${NC}"
+    echo
+    
+    printf "%-30s %-25s %-12s\n" "VM Name" "Resource Group" "Subscription"
+    printf "%-30s %-25s %-12s\n" "-------" "--------------" "------------"
+    
+    while IFS='|' read -r vm_name rg subscription; do
+        if [ -n "$vm_name" ]; then
+            printf "%-30s %-25s %-12s\n" "$vm_name" "$rg" "${subscription:0:8}..."
+        fi
+    done < "$failed_vms"
+    
+    echo
+    echo -e "${WHITE}Available Actions for these $failed_count failed VMs:${NC}"
+    echo -e "${BLUE}1)${NC} Restart all failed VMs"
+    echo -e "${BLUE}2)${NC} Trigger fresh assessment"
+    echo -e "${BLUE}3)${NC} Retry patch installation"
+    echo -e "${BLUE}4)${NC} Restart + Retry patches (recommended)"
+    echo -e "${BLUE}5)${NC} Export list to file"
+    echo -e "${BLUE}6)${NC} Return to previous menu"
+    echo
+    
+    read -p "Select action (1-6): " action
+    
+    case $action in
+        1)
+            echo
+            read -p "Restart all $failed_count failed VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Restarting failed VMs...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        restart_vm "$subscription" "$rg" "$vm_name" &
+                        (($(jobs -r | wc -l) >= 10)) && wait
+                    fi
+                done < "$failed_vms"
+                wait
+                echo -e "${GREEN}All restart commands issued.${NC}"
+            fi
+            ;;
+        2)
+            echo
+            read -p "Trigger assessment on all $failed_count failed VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Triggering assessments...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        trigger_assessment "$subscription" "$rg" "$vm_name" &
+                        (($(jobs -r | wc -l) >= 10)) && wait
+                    fi
+                done < "$failed_vms"
+                wait
+                echo -e "${GREEN}All assessment commands issued.${NC}"
+            fi
+            ;;
+        3)
+            echo
+            read -p "Retry patches on all $failed_count failed VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Retrying patch installations...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        install_updates "$subscription" "$rg" "$vm_name"
+                    fi
+                done < "$failed_vms"
+                echo -e "${GREEN}All patch commands issued.${NC}"
+            fi
+            ;;
+        4)
+            echo
+            read -p "Restart + retry patches on all $failed_count failed VMs? (yes/no): " confirm
+            if [ "$confirm" = "yes" ]; then
+                echo -e "${CYAN}Step 1/2: Restarting...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        restart_vm "$subscription" "$rg" "$vm_name" &
+                        (($(jobs -r | wc -l) >= 10)) && wait
+                    fi
+                done < "$failed_vms"
+                wait
+                echo -e "${GREEN}Restarts issued.${NC}"
+                echo -e "${YELLOW}Waiting 60s for VMs to restart...${NC}"
+                for i in {60..1}; do
+                    echo -ne "\r${i}s remaining...  "
+                    sleep 1
+                done
+                echo
+                echo -e "${CYAN}Step 2/2: Retrying patches...${NC}"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        install_updates "$subscription" "$rg" "$vm_name"
+                        sleep 2
+                    fi
+                done < "$failed_vms"
+                echo -e "${GREEN}All retry commands issued.${NC}"
+            fi
+            ;;
+        5)
+            OUTPUT_FILE="failed_vms_$(date +%Y%m%d_%H%M%S).txt"
+            {
+                echo "Failed VMs - $(date)"
+                echo "===================="
+                printf "%-30s %-25s %-40s\n" "VM Name" "Resource Group" "Subscription ID"
+                printf "%-30s %-25s %-40s\n" "-------" "--------------" "---------------"
+                while IFS='|' read -r vm_name rg subscription; do
+                    if [ -n "$vm_name" ]; then
+                        printf "%-30s %-25s %-40s\n" "$vm_name" "$rg" "$subscription"
+                    fi
+                done < "$failed_vms"
+            } > "$OUTPUT_FILE"
+            echo -e "${GREEN}Exported to: $OUTPUT_FILE${NC}"
+            ;;
+        6)
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
+    
+    rm -f "$failed_file" "$failed_vms"
 }
 
 # Function to show deallocated machine details
@@ -1088,6 +1303,7 @@ main_menu() {
             echo -e "${CYAN}Available Options:${NC}"
             echo -e "${BLUE}L)${NC} Live Status Monitor"
             echo -e "${BLUE}4)${NC} Trigger assessment on all VMs with no recent assessment data"
+            echo -e "${BLUE}A)${NC} ${YELLOW}Trigger assessment on ALL Windows VMs (across all subscriptions)${NC}"
             echo -e "${BLUE}D)${NC} Show and manage deallocated VMs"
             echo -e "${BLUE}F)${NC} Show and manage failed VMs"
             echo -e "${BLUE}8)${NC} Exit"
@@ -1100,6 +1316,9 @@ main_menu() {
                     ;;
                 4)
                     trigger_assessment_no_recent
+                    ;;
+                A|a)
+                    trigger_assessment_all_vms
                     ;;
                 D|d)
                     manage_deallocated_vms
@@ -1133,6 +1352,7 @@ main_menu() {
         echo -e "${BLUE}2)${NC} Install updates on all target VMs"
         echo -e "${BLUE}3)${NC} Trigger assessment on all target VMs (pending updates)"
         echo -e "${BLUE}4)${NC} Trigger assessment on VMs with no recent assessment data"
+        echo -e "${BLUE}A)${NC} ${YELLOW}Trigger assessment on ALL Windows VMs (across all subscriptions)${NC}"
         echo -e "${BLUE}5)${NC} Show detailed resource IDs"
         echo -e "${BLUE}6)${NC} Export list to file"
         echo -e "${BLUE}7)${NC} Refresh status"
@@ -1159,6 +1379,9 @@ main_menu() {
                 ;;
             4)
                 trigger_assessment_no_recent
+                ;;
+            A|a)
+                trigger_assessment_all_vms
                 ;;
             5)
                 show_detailed_ids
@@ -1258,6 +1481,89 @@ execute_assessment_targets() {
         echo "Operation cancelled."
         read -p "Press Enter to continue..." -n 1
     fi
+}
+
+# Function to trigger assessment on ALL Windows VMs
+trigger_assessment_all_vms() {
+    echo
+    echo -e "${YELLOW}WARNING: This will trigger assessment on ALL running Windows VMs across ALL subscriptions!${NC}"
+    echo -e "${CYAN}Getting all Windows VMs...${NC}"
+    
+    ALL_VMS_FILE=$(mktemp)
+    get_all_vms > "$ALL_VMS_FILE"
+    
+    ALL_VMS_COUNT=$(safe_count "$ALL_VMS_FILE")
+    
+    if [ "$ALL_VMS_COUNT" -eq 0 ]; then
+        echo "No running Windows VMs found."
+        rm -f "$ALL_VMS_FILE"
+        read -p "Press Enter to continue..." -n 1
+        return
+    fi
+    
+    echo -e "${YELLOW}Found $ALL_VMS_COUNT running Windows VMs across all subscriptions.${NC}"
+    echo
+    
+    # Convert to VM identifiers
+    ALL_VMS_INFO=$(mktemp)
+    while IFS= read -r resource_id; do
+        if [ -n "$resource_id" ]; then
+            vm_info=$(parse_vm_info "$resource_id")
+            read -r subscription rg vm_name <<< "$vm_info"
+            echo "${vm_name}|${rg}|${subscription}" >> "$ALL_VMS_INFO"
+        fi
+    done < "$ALL_VMS_FILE"
+    
+    # Show sample of VMs
+    echo "Sample of VMs (showing first 10):"
+    printf "%-30s %-25s %-12s\n" "VM Name" "Resource Group" "Subscription"
+    printf "%-30s %-25s %-12s\n" "-------" "--------------" "------------"
+    
+    local display_count=0
+    while IFS='|' read -r vm_name rg subscription && [ $display_count -lt 10 ]; do
+        if [ -n "$vm_name" ]; then
+            printf "%-30s %-25s %-12s\n" "$vm_name" "$rg" "${subscription:0:8}..."
+            display_count=$((display_count + 1))
+        fi
+    done < "$ALL_VMS_INFO"
+    
+    if [ "$ALL_VMS_COUNT" -gt 10 ]; then
+        echo "... and $((ALL_VMS_COUNT - 10)) more VMs"
+    fi
+    
+    echo
+    echo -e "${RED}This will trigger $ALL_VMS_COUNT assessment operations!${NC}"
+    read -p "Are you sure you want to proceed? (yes/no): " confirm
+    
+    if [ "$confirm" = "yes" ]; then
+        echo -e "${CYAN}Triggering assessments on all $ALL_VMS_COUNT VMs...${NC}"
+        echo "This may take a while..."
+        
+        local assessed_count=0
+        while IFS='|' read -r vm_name rg subscription; do
+            if [ -n "$vm_name" ]; then
+                trigger_assessment "$subscription" "$rg" "$vm_name" &
+                assessed_count=$((assessed_count + 1))
+                
+                # Limit concurrent operations
+                (($(jobs -r | wc -l) >= 10)) && wait
+                
+                # Progress indicator
+                if [ $((assessed_count % 50)) -eq 0 ]; then
+                    echo "Progress: $assessed_count / $ALL_VMS_COUNT assessments triggered..."
+                fi
+            fi
+        done < "$ALL_VMS_INFO"
+        wait
+        
+        echo -e "${GREEN}All $ALL_VMS_COUNT assessment commands issued (running in background).${NC}"
+        echo -e "${YELLOW}Assessments will complete over the next 5-10 minutes.${NC}"
+    else
+        echo "Operation cancelled."
+    fi
+    
+    rm -f "$ALL_VMS_FILE" "$ALL_VMS_INFO"
+    read -p "Press Enter to continue..." -n 1
 }
 
 # Function to trigger assessment on machines with no recent assessment
