@@ -1,6 +1,6 @@
 # Azure Update Manager - Patch Dashboard
 
-Live monitoring and management tool for Azure Update Manager patch operations.
+Live monitoring and management tool for Azure Update Manager patch operations across subscriptions in a tenant.
 
 ## Requirements
 
@@ -18,18 +18,10 @@ az login
 
 ## Features
 
-- Real-time patch status monitoring
-- Event stream showing patch installations (last 20 min)
+- Real-time patch status monitoring - placing VMs into a patch success category; succeeded, failed, running, etc 
+- Event stream showing patch installations per the AUM history log
 - Bulk operations (restart, patch, assess)
-- Failed VM management with error details
-- Deallocated VM management
+- Identify failed VMs and their error details
+- Deallocated VM management - time to wake up, it's patching time!
 
-## Usage
 
-Run the script and choose:
-- **L** - Live monitoring dashboard (auto-refresh every 30s)
-- **F** - Manage failed VMs (restart + retry recommended)
-- **D** - Manage deallocated VMs
-- **1-3** - Bulk operations on pending VMs
-
-Press **m** in live monitor to return to menu.
