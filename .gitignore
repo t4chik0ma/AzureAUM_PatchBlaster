@@ -1,0 +1,32 @@
+# Exported VM lists
+target_vms_*.txt
+failed_vms_*.txt
+deallocated_vms_*.txt
+
+# Temporary files
+*.tmp
+.last_seen_events_*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
